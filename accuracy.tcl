@@ -8,73 +8,91 @@ lappend engine_options [list MultiPV 1]
 lappend engine_options [list Threads 4]
 lappend engine_options [list Hash 1024]
 set engine_limits {}
-lappend engine_limits [list depth 26]
-lappend engine_limits [list movetime 600000]
+lappend engine_limits [list depth 40]
+# lappend engine_limits [list movetime 600000]
 
 proc new_accuracy {} {
     set ::prev_best_move ""
     set ::prev_best_move_evaluation 0
-    return [list 0 0 0 0 0 0 0]
+    return {}
 }
 
-# Calculate accuracy:
-# 1. Adjustment Tier: Multiplier based on the previous move's evaluation:
-#    - Formula: Tier = 1 + 0.005 x | previous_evaluation |
-# 2. Move Classification: Categorizes the move using the centipawn difference and the adjustment tier:
-#    - "Perfect" if Difference <= 10
-#    - "Good" if Difference <= 20 x Tier
-#    - "Inaccurate" if Difference <= 50 x Tier
-#    - "Mistake" if Difference <= 100 x Tier
-#    - "Blunder" for all larger differences.
-# 3. Game Accuracy: Weighted average of move classifications:
-#    - Weights: 1.0, 0.8, 0.3, 0.1, 0.0
-#    - Formula: Accuracy = SumOf(weighted_category_num_of_moves) / num_of_moves
+proc move_classification {accuracy} {
+    if {$accuracy > 1.0} { return "Unreal" }
+    if {$accuracy == 1} { return "Perfect" }
+    if {$accuracy > 0.9} { return "Great" }
+    if {$accuracy > 0.8} { return "Good" }
+    if {$accuracy > 0.6} { return "Inaccurate" }
+    if {$accuracy > 0.4} { return "Mistake" }
+    return "Blunder"
+}
+
+# Accuracy Calculation:
+# 1. Compute the centipawn loss.
+# 2. Adjust the decay factor based on the previous best evaluation.
+# 3. Determine accuracy by applying a decay function to the centipawn loss.
+# 4. Classify the move based on its accuracy.
 proc update_accuracy {accuracy_list last_move} {
-    # The last evaluations received from the engine are stored in a global array
+    # The last evaluations received from the engine were stored in a global array
     lassign $::enginePVs(1) score_pv1 score_type1 pv1
     if {$score_type1 eq "mate"} { set score_pv1 [expr {$score_pv1 < 0 ? -9999 : 9999}] }
 
-    lassign $accuracy_list avg_cp_loss accuracy n_perf n_good n_inac n_mist n_blun
     if {$::prev_best_move eq $last_move} {
-        set cp_difference 0
+        set cp_loss 0
+        set accuracy 1
+        set classification "Engine"
     } else {
         # score_pv1 is from the opponent POV: prev_best_move_evaluation - -1 * score_pv1
-        set cp_difference [expr {$::prev_best_move_evaluation + $score_pv1}]
+        set cp_loss [expr {$::prev_best_move_evaluation + $score_pv1}]
+        set decay [expr {$::prev_best_move_evaluation / 1000000.0 - 0.003}]
+        set accuracy [expr {2 * exp($decay * $cp_loss) - 1}]
+        set classification [move_classification $accuracy]
     }
-
-    # Average cp loss
-    set n_moves [expr {$n_perf + $n_good + $n_inac +$n_mist + $n_blun}]
-    set total_cp_loss [expr {$avg_cp_loss * $n_moves}]
-    incr n_moves
-    set avg_cp_loss [expr {($total_cp_loss + $cp_difference) / $n_moves}]
-
-    # Modified Tiered Move Analysis
-    set adjust_tier [expr {1.0 + 0.005 * abs($::prev_best_move_evaluation)}]
-    if {$cp_difference <= 10} {
-        incr n_perf
-    } elseif {$cp_difference <= 20 * $adjust_tier} {
-        incr n_good
-    } elseif {$cp_difference <= 50 * $adjust_tier} {
-        incr n_inac
-    } elseif {$cp_difference <= 100 * $adjust_tier} {
-        incr n_mist
-    } else {
-        incr n_blun
-    }
-
-    # Calculate game accuracy
-    set weighted [lmap v [list $n_perf $n_good $n_inac $n_mist $n_blun] w [list 1.0 0.8 0.3 0.1 0.0] { expr {1.0 * $v * $w }}]
-    set accuracy 0.0
-    foreach {value} $weighted {
-        set accuracy [expr {$accuracy + $value}]
-    }
-    set accuracy [expr {$accuracy / $n_moves}]
 
     # Store the expected best move for the next iteration
     set ::prev_best_move $::engineBestMove
     set ::prev_best_move_evaluation $score_pv1
 
-    return [list $avg_cp_loss $accuracy $n_perf $n_good $n_inac $n_mist $n_blun]
+    if {$last_move ne ""} {
+        puts "[format "%6s" $last_move]  cp_loss: [format "%-4d" $cp_loss]  accuracy: [format "%6.2f%%"  [expr {$accuracy * 100}]]  $classification"
+    }
+
+    lappend accuracy_list $last_move $classification $accuracy $cp_loss
+    return $accuracy_list
+}
+
+proc move_classification {accuracy} {
+    if {$accuracy > 1.0} { return "Unreal" }
+    if {$accuracy == 1} { return "Perfect" }
+    if {$accuracy > 0.9} { return "Great" }
+    if {$accuracy > 0.8} { return "Good" }
+    if {$accuracy > 0.6} { return "Inaccurate" }
+    if {$accuracy > 0.4} { return "Mistake" }
+    return "Blunder"
+}
+
+# Count the moves for each classification and calculate the average centipawn loss and accuracy.
+# Accuracy is adjusted to a (0,1) range before the average calculation.
+proc reduce_accuracy_list {accuracy_list} {
+    set n_accuracy 0
+    set n_cp_loss 0
+    array set res [list accuracy 0 cp_loss 0]
+    foreach {last_move classification accuracy cp_loss} $accuracy_list {
+        set clamp_accuracy [expr {max(0, min(1, $accuracy))}]
+        set res(accuracy) [expr {$res(accuracy) + $clamp_accuracy}]
+        incr n_accuracy
+        set res(cp_loss) [expr {$res(cp_loss) + $cp_loss}]
+        incr n_cp_loss
+        if {![info exist res($classification)]} {
+            set res($classification) 0
+        }
+        incr res($classification)
+    }
+    if {$n_accuracy > 0} {
+        set res(accuracy) [expr {$res(accuracy) / $n_accuracy}]
+        set res(cp_loss) [expr {$res(cp_loss) / $n_cp_loss}]
+    }
+    return [array get res]
 }
 
 # Parse input args
@@ -87,7 +105,7 @@ if {$engine_exe eq "" || $input_database eq ""} {
 
 # Load the engine module from scid
 set scidDir [file nativename [file dirname [info nameofexecutable]]]
-source -encoding utf-8 [file nativename [file join $::scidDir ".." "tcl" "enginecomm.tcl"]]
+source -encoding utf-8 [file nativename [file join $::scidDir "tcl" "enginecomm.tcl"]]
 
 # Callbacks from the engines
 # Store the latest PV into the global array ::enginePV(PV)
@@ -136,11 +154,13 @@ for {set i 1} {$i <= $nGames} {incr i} {
         set last_to_move [expr {$last_to_move eq "white" ? "black" : "white"}]
     }
     foreach {key} {"white" "black"} {
-        lassign $player($key) avg_cp_loss accuracy n_perf n_good n_inac n_mist n_blun
         puts "$key:"
-        puts "  Average CP Loss: $avg_cp_loss"
-        puts "  Accuracy       : [format "%.2f%%" [expr {$accuracy * 100}]]"
-        puts "  Best:[format %3d $n_perf]  Good:[format %3d $n_good]  Inaccuracies:[format %3d $n_inac]  Mistakes:[format %3d $n_mist]  Blunders:[format %3d $n_blun]"
+        foreach {key value} [reduce_accuracy_list $player($key)] {
+            if {$key eq "accuracy"} {
+                set value [format "%.2f%%" [expr {$value * 100}]]
+            }
+            puts "  $key: $value"
+        }
     }
     puts "--------------------------"
 }
